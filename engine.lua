@@ -45,6 +45,7 @@ local unresolvedCollectObjects = {}
 
 local hasUnreachableItems = false
 local hasUnresolvedItems = false
+local isTransferCompleted = false
 
 -- Runtime state tracking untuk pemulihan disconnect
 local runtimeState = {
@@ -58,9 +59,11 @@ local runtimeState = {
 -- Lifecycle handler
 function on_stop(error_message)
     if error_message ~= "" then
-        print("[Transfer] Script dihentikan dengan pesan: " .. error_message)
+        print("[Transfer] Script dihentikan dengan pesan error: " .. error_message)
+    elseif not isTransferCompleted then
+        print("[Transfer] Script dihentikan sebelum seluruh proses transfer tuntas.")
     else
-        print("[Transfer] Script selesai secara normal.")
+        print("[Transfer] Script selesai secara normal (seluruh transfer tuntas).")
     end
 end
 
@@ -408,7 +411,7 @@ local function executeStorageDrop()
 
             while shiftCount < maxShifts do
                 local localAttempts = 0
-                local tileConfirmedFull = false
+                local shouldShiftRight = false
 
                 while localAttempts < 3 do
                     localAttempts = localAttempts + 1
@@ -455,20 +458,37 @@ local function executeStorageDrop()
                             print(string.format("[Storage] Drop sebagian berhasil (%d -> %d). Mencoba sisa di tile yang sama...", before, after))
                             localAttempts = 0
                         else
-                            -- after == before
-                            local activeWorldObj = bot:getWorld()
-                            local floatingAtTile = math.max(
-                                countFloatingObjectsAtTile(activeWorldObj, pos.x + 1, pos.y),
-                                countFloatingObjectsAtTile(activeWorldObj, pos.x, pos.y)
-                            )
+                            -- after == before: DROP GAGAL!
+                            -- Berikan jeda 1.5 detik (1-2 detik sesuai arahan Bos Anas)
+                            print(string.format("[Storage] Drop belum berkurang di (%d, %d) (Percobaan %d/3, sisa di tas: %d). Memberi jeda 1.5 detik...", 
+                                pos.x, pos.y, localAttempts, after))
+                            pacingSleep(1500)
 
-                            if floatingAtTile >= 20 then
-                                print(string.format("[Storage] Tile tujuan (%d, %d) TERVERIFIKASI PENUH (%d floating objects >= 20).", pos.x, pos.y, floatingAtTile))
-                                tileConfirmedFull = true
+                            -- Setelah jeda, verifikasi ulang koneksi & tas (siapa tahu paket drop baru diproses server)
+                            ensureConnectionAndPosition(CONFIG.STORAGE_WORLD, pos.x, pos.y)
+                            after = bot:getInventory():findItem(itemID)
+
+                            if after == 0 then
+                                dropSuccess = true
+                                print(string.format("[Storage] Sukses (terkonfirmasi pasca-jeda): Item ID %d telah ter-drop di (%d, %d)", itemID, pos.x, pos.y))
                                 break
+                            elseif after < before then
+                                print(string.format("[Storage] Drop sebagian berhasil pasca-jeda (%d -> %d). Mencoba sisa...", before, after))
+                                localAttempts = 0
                             else
-                                print(string.format("[Storage] Drop belum berkurang di (%d, %d) (Percobaan %d/3, floating objects: %d). Mencoba ulang di tile yang sama...", 
-                                    pos.x, pos.y, localAttempts, floatingAtTile))
+                                -- Cek apakah tile sudah terisi floating objects atau sudah 3x percobaan gagal
+                                local activeWorldObj = bot:getWorld()
+                                local floatingAtTile = math.max(
+                                    countFloatingObjectsAtTile(activeWorldObj, pos.x + 1, pos.y),
+                                    countFloatingObjectsAtTile(activeWorldObj, pos.x, pos.y)
+                                )
+
+                                if floatingAtTile >= 14 or localAttempts >= 3 then
+                                    print(string.format("[Storage] Tile (%d, %d) gagal menampung drop (floating objects: %d, percobaan: %d). Mencari lokasi baru ke kanan...", 
+                                        pos.x, pos.y, floatingAtTile, localAttempts))
+                                    shouldShiftRight = true
+                                    break
+                                end
                             end
                         end
                     end
@@ -476,17 +496,14 @@ local function executeStorageDrop()
 
                 if dropSuccess then
                     break
-                elseif tileConfirmedFull then
-                    -- Tile memang terbukti penuh secara fisik -> geser ke kanan (pos.x + 1)
+                elseif shouldShiftRight then
                     shiftCount = shiftCount + 1
                     pos.x = pos.x + 1
-                    print(string.format("[Storage] Menggeser slot Item ID %d ke kanan: (%d, %d)...", itemID, pos.x, pos.y))
-                    walkToTileSafely(CONFIG.STORAGE_WORLD, pos.x, pos.y)
-                    bot:setDirection(false)
+                    print(string.format("[Storage] Maju ke kanan mencari lokasi drop baru untuk Item ID %d: (%d, %d)...", itemID, pos.x, pos.y))
+                    shouldShiftRight = false
+                    pacingSleep(500)
                 else
-                    -- 3 kali percobaan tidak berkurang dan tile TIDAK terbukti 20 objek:
-                    -- Ini kegagalan ambigu (gangguan jaringan/server reject). JANGAN GESER SLOT!
-                    print(string.format("[Storage Warning] Drop Item ID %d di (%d, %d) tidak tuntas setelah 3 percobaan (bukan karena kapasitas penuh). Menghentikan drop demi keamanan agar slot tidak berantakan.", itemID, pos.x, pos.y))
+                    print(string.format("[Storage Warning] Drop Item ID %d di (%d, %d) tidak tuntas. Menghentikan drop demi keamanan.", itemID, pos.x, pos.y))
                     return false
                 end
             end
@@ -716,9 +733,11 @@ if leftover > 0 then
 end
 
 if hasUnreachableItems or hasUnresolvedItems then
+    isTransferCompleted = true
     print(string.format("[Finish] PROSES SELESAI DENGAN CATATAN: Terdata %s%s. Seluruh item yang berhasil dijangkau telah dipindahkan ke storage.",
         hasUnreachableItems and "objek terhalang jalur (unreachable) " or "",
         hasUnresolvedItems and "objek belum tuntas terambil (ambigu)" or ""))
 else
+    isTransferCompleted = true
     print("[Finish] SEMUA ITEM DARI SELURUH TAKE WORLD TELAH BERHASIL DIPINDAHKAN KE STORAGE TANPA SISA! Script selesai.")
 end
