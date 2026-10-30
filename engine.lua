@@ -36,7 +36,7 @@ end
 local dropPositions = {}
 local storageBaseOrigin = nil
 
--- Blacklist objek yang gagal di-collect berkali-kali (hanya jika online & gagal valid)
+-- Blacklist objek yang gagal di-collect berkali-kali (hanya jika online stabil & gagal valid)
 local failedCollectCount = {}
 local hasUnreachableItems = false
 
@@ -77,6 +77,15 @@ local function isAtWhiteDoor()
     return tile ~= nil and tile.fg == 6
 end
 
+-- Helper verifikasi nama world secara case-insensitive
+local function isInTargetWorld(dest)
+    if not bot:isInWorld() then return false end
+    local worldName = type(dest) == "table" and dest.world or dest
+    if not worldName or worldName == "" then return false end
+    local upper = worldName:upper()
+    return bot:isInWorld(worldName) or bot:isInWorld(upper)
+end
+
 -- Warp dengan verifikasi arrival
 local function warpAndVerify(dest, timeoutSec)
     local worldName = type(dest) == "table" and dest.world or dest
@@ -99,7 +108,7 @@ local function warpAndVerify(dest, timeoutSec)
                 bot:warp(upper, doorId)
             end
         end
-        if (bot:isInWorld(worldName) or bot:isInWorld(upper)) and bot:isInWorld() then
+        if isInTargetWorld(worldName) then
             sleep(800) -- buffer settling tile & object streaming dari server
             return true
         end
@@ -109,11 +118,10 @@ local function warpAndVerify(dest, timeoutSec)
 end
 
 -- Reconnect & Position Guard komprehensif
--- Menjaga bot online, memastikan di world tujuan, dan pulih dari White Door ke (targetX, targetY)
+-- Menjamin bot online, benar-benar berada di world tujuan, dan pulih dari White Door
 local function ensureConnectionAndPosition(dest, targetX, targetY)
     local worldName = type(dest) == "table" and dest.world or dest
     local doorId = type(dest) == "table" and (dest.door or "") or ""
-    local upper = type(worldName) == "string" and worldName:upper() or worldName
 
     -- 1. Pulihkan koneksi jika bot offline (dibatasi 30 siklus = 5 menit)
     if bot.status ~= BotStatus.online then
@@ -122,7 +130,7 @@ local function ensureConnectionAndPosition(dest, targetX, targetY)
         while not waitOnline(10) do
             attempts = attempts + 1
             if attempts >= 30 then
-                print("[Guard] Timeout: Bot gagal reconnect setelah 5 menit. Menghentikan guard.")
+                print("[Guard] Timeout: Bot gagal reconnect setelah 5 menit.")
                 return false
             end
             sleep(1000)
@@ -131,10 +139,14 @@ local function ensureConnectionAndPosition(dest, targetX, targetY)
         sleep(800)
     end
 
-    -- 2. Pastikan bot berada di world tujuan
-    if not bot:isInWorld() or (not bot:isInWorld(worldName) and not bot:isInWorld(upper)) then
-        print(string.format("[Guard] Bot belum di world '%s'. Melakukan warp recovery...", worldName))
-        warpAndVerify({ world = worldName, door = doorId }, settings.WARP_TIMEOUT or 20)
+    -- 2. Pastikan bot benar-benar berada di WORLD TUJUAN (bukan asal in-world di world lama!)
+    if not isInTargetWorld(dest) then
+        print(string.format("[Guard] Bot belum berada di world tujuan '%s'. Melakukan warp recovery...", worldName))
+        local warpOk = warpAndVerify({ world = worldName, door = doorId }, settings.WARP_TIMEOUT or 20)
+        if not warpOk or not isInTargetWorld(dest) then
+            print(string.format("[Guard Error] Gagal mencapai world tujuan: %s", worldName))
+            return false
+        end
     end
 
     -- 3. Pemulihan dari White Door (ID 6)
@@ -156,7 +168,8 @@ local function ensureConnectionAndPosition(dest, targetX, targetY)
         end
     end
 
-    return bot.status == BotStatus.online and bot:isInWorld()
+    -- Verifikasi final: bot harus online DAN berada di world target
+    return bot.status == BotStatus.online and isInTargetWorld(dest)
 end
 
 local function countTargetItemsInInventory()
@@ -182,7 +195,7 @@ end
 
 -- Memindai seluruh objek target di world dengan proteksi disconnect:
 -- Return:
--- 1. isReady: boolean (false jika world belum settled/bot disconnect)
+-- 1. isReady: boolean (false jika world belum settled atau bot disconnect saat scan)
 -- 2. totalFloating: jumlah seluruh objek target di lantai
 -- 3. takeableList: list objek yang tasnya muat (< 200) & belum blacklist
 -- 4. capacityDeferredCount: jumlah objek yang belum blacklist tapi tasnya sudah penuh (>= 200)
@@ -201,6 +214,13 @@ local function scanWorldTargetObjects(activeWorld)
 
     local objects = world:getObjects()
     if not objects then return false, 0, {}, 0, 0 end
+
+    -- Verifikasi ulang status bot SETELAH pemanggilan getObjects()
+    -- Mencegah false-clean saat koneksi terputus di tengah streaming objek
+    if bot.status ~= BotStatus.online or not isInTargetWorld(activeWorld) then
+        print("[Take] Terdeteksi disconnect saat/setelah getObjects(). Scan dibatalkan untuk diulang.")
+        return false, 0, {}, 0, 0
+    end
 
     local totalFloating = 0
     local takeableList = {}
@@ -251,7 +271,7 @@ local function executeStorageDrop()
     print("[Storage] Memulai proses drop di Storage World...")
 
     if not ensureConnectionAndPosition(CONFIG.STORAGE_WORLD) then
-        print("[Error] Gagal masuk dan memverifikasi Storage World!")
+        print("[Critical Error] Gagal memverifikasi kedatangan di Storage World! Drop dibatalkan demi keamanan.")
         return false
     end
 
@@ -290,14 +310,15 @@ local function executeStorageDrop()
     local allItemsDropped = true
 
     for _, itemID in ipairs(CONFIG.ITEMS or {}) do
-        -- Pastikan bot online & di storage world sebelum memproses item ini
         local pos = dropPositions[itemID]
         runtimeState.targetX = pos.x
         runtimeState.targetY = pos.y
 
-        ensureConnectionAndPosition(CONFIG.STORAGE_WORLD, pos.x, pos.y)
+        if not ensureConnectionAndPosition(CONFIG.STORAGE_WORLD, pos.x, pos.y) then
+            print(string.format("[Storage Error] Gagal memverifikasi posisi drop Item ID %d!", itemID))
+            return false
+        end
 
-        -- Baca ulang backpack secara realtime
         local count = bot:getInventory():findItem(itemID)
         if count > 0 then
             bot:findPath(pos.x, pos.y)
@@ -306,47 +327,72 @@ local function executeStorageDrop()
             local dropSuccess = false
             local retry = 0
             local maxRetry = settings.MAX_DROP_RETRY or 15
+            local consecutiveRejections = 0
 
             while retry < maxRetry do
-                -- Cek kondisi sebelum drop
-                ensureConnectionAndPosition(CONFIG.STORAGE_WORLD, pos.x, pos.y)
+                if not ensureConnectionAndPosition(CONFIG.STORAGE_WORLD, pos.x, pos.y) then
+                    print("[Storage Error] Koneksi terputus permanen saat proses drop!")
+                    return false
+                end
+
                 local before = bot:getInventory():findItem(itemID)
                 if before == 0 then
                     dropSuccess = true
                     break
                 end
 
+                bot:findPath(pos.x, pos.y)
                 bot:setDirection(false)
+
+                local statusBefore = bot.status
                 bot:fastDrop(itemID, before)
                 sleep(settings.DROP_DELAY or 400)
 
-                -- Deteksi disconnect saat atau sesudah fastDrop
-                if bot.status ~= BotStatus.online or not bot:isInWorld() then
-                    print("[Storage] Disconnect terdeteksi pasca-drop. Menjalankan recovery & verifikasi tas...")
+                -- Deteksi apakah proses drop tadi terinterupsi oleh disconnect
+                local wasInterruptedByDC = (statusBefore ~= BotStatus.online or bot.status ~= BotStatus.online or not isInTargetWorld(CONFIG.STORAGE_WORLD))
+
+                if wasInterruptedByDC then
+                    print("[Storage] Terdeteksi gangguan koneksi saat/pasca-drop. Menjalankan recovery...")
                     ensureConnectionAndPosition(CONFIG.STORAGE_WORLD, pos.x, pos.y)
                     bot:setDirection(false)
                 end
 
-                -- BACA ULANG BACKPACK SETELAH PEMULIHAN
+                -- BACA ULANG BACKPACK SETELAH PULIH
                 local after = bot:getInventory():findItem(itemID)
 
                 if after == 0 then
-                    -- Drop sukses (termasuk jika diterima server sebelum disconnect!)
+                    -- Drop sukses (termasuk jika diterima server sebelum DC terdeteksi)!
                     dropSuccess = true
                     print(string.format("[Storage] Sukses: Item ID %d (%d unit) telah ter-drop di (%d, %d)", itemID, before, pos.x, pos.y))
                     break
                 elseif after < before then
-                    -- Drop sebagian berhasil (misal sisa kapasitas tile hanya muat separuh)
-                    print(string.format("[Storage] Drop sebagian berhasil (%d -> %d). Mencoba sisa di tile ini...", before, after))
+                    -- Sebagian unit item ter-drop
+                    print(string.format("[Storage] Drop sebagian berhasil (%d -> %d). Mencoba sisa di tile yang sama...", before, after))
+                    consecutiveRejections = 0
                 else
-                    -- after == before: Tile benar-benar penuh, geser 1 tile ke kanan
-                    retry = retry + 1
-                    pos.x = pos.x + 1
-                    print(string.format("[Storage] Tile (%d, %d) penuh/gagal drop ID %d. Geser ke kanan (%d, %d)...", pos.x - 1, pos.y, itemID, pos.x, pos.y))
+                    -- after == before
+                    if wasInterruptedByDC then
+                        -- GAGAL KARENA DC (BUKAN KARENA TILE PENUH)!
+                        -- JANGAN GESER SLOT KE KANAN! Coba drop ulang di tile yang sama.
+                        print(string.format("[Storage] Drop terinterupsi koneksi putus (bukan tile penuh). Mencoba ulang di (%d, %d)...", pos.x, pos.y))
+                    else
+                        -- Bot online stabil tapi drop tidak berkurang:
+                        -- Butuh konfirmasi penolakan berturut-turut sebelum menggeser slot
+                        consecutiveRejections = consecutiveRejections + 1
+                        if consecutiveRejections >= 2 then
+                            -- Terkonfirmasi 2x ditolak saat online stabil -> TILE BENAR-BENAR PENUH (20 objek)
+                            retry = retry + 1
+                            pos.x = pos.x + 1
+                            consecutiveRejections = 0
+                            print(string.format("[Storage] Tile (%d, %d) penuh/gagal drop ID %d. Geser ke kanan (%d, %d)...", pos.x - 1, pos.y, itemID, pos.x, pos.y))
 
-                    ensureConnectionAndPosition(CONFIG.STORAGE_WORLD, pos.x, pos.y)
-                    bot:findPath(pos.x, pos.y)
-                    bot:setDirection(false)
+                            ensureConnectionAndPosition(CONFIG.STORAGE_WORLD, pos.x, pos.y)
+                            bot:findPath(pos.x, pos.y)
+                            bot:setDirection(false)
+                        else
+                            print(string.format("[Storage] Percobaan drop belum berkurang di (%d, %d). Mengulang konfirmasi sebelum geser...", pos.x, pos.y))
+                        end
+                    end
                 end
             end
 
@@ -491,8 +537,10 @@ while runtimeState.currentTakeIndex <= #takeWorlds do
                 bot:collectObject(targetObj.oid, 2)
                 sleep(200)
 
-                -- Cek apakah terjadi DC saat collect
-                if bot.status ~= BotStatus.online or not bot:isInWorld() then
+                -- Cek apakah terjadi interupsi DC saat collect
+                local wasDC = (bot.status ~= BotStatus.online or not isInTargetWorld(currentTakeWorld))
+
+                if wasDC then
                     print("[Take] Terdeteksi disconnect saat collect! Melakukan recovery...")
                     ensureConnectionAndPosition(currentTakeWorld, targetObj.x, targetObj.y)
                 end
@@ -501,12 +549,14 @@ while runtimeState.currentTakeIndex <= #takeWorlds do
                 local afterCount = bot:getInventory():findItem(targetObj.id)
 
                 if afterCount == beforeCount then
-                    -- Hanya tambahkan blacklist jika bot benar-benar online & gagal mengambil
-                    if bot.status == BotStatus.online and bot:isInWorld() then
+                    -- HANYA TAMBAHKAN BLACKLIST JIKA ONLINE STABIL DAN TIDAK ADA INTERUPSI DC!
+                    if not wasDC and bot.status == BotStatus.online and isInTargetWorld(currentTakeWorld) then
                         failedCollectCount[targetObj.oid] = (failedCollectCount[targetObj.oid] or 0) + 1
+                    else
+                        print(string.format("[Take] Pengambilan OID %d terinterupsi koneksi putus; percobaan tidak dihitung sebagai kegagalan jangkauan.", targetObj.oid))
                     end
                 else
-                    -- Sukses ambil (meskipun tadi sempat DC sesaat)!
+                    -- Sukses ambil
                     failedCollectCount[targetObj.oid] = nil
                 end
 
