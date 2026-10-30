@@ -126,6 +126,7 @@ local function countFloatingObjectsAtTile(world, tx, ty)
 end
 
 -- Warp dengan verifikasi arrival
+-- Sesuai signature resmi Lucifer: warp(name: string) atau warp(name: string, id: string)
 local function warpAndVerify(dest, timeoutSec)
     local worldName = type(dest) == "table" and dest.world or dest
     local doorId = type(dest) == "table" and (dest.door or "") or ""
@@ -138,16 +139,34 @@ local function warpAndVerify(dest, timeoutSec)
     end
 
     bot.leave_world_before_warp = false
-    bot:warp(upper, doorId)
+
+    -- Signature resmi Lucifer: HANYA kirim argumen kedua jika door ID ada & tidak kosong!
+    if doorId and doorId ~= "" then
+        bot:warp(upper, doorId)
+    else
+        bot:warp(upper)
+    end
 
     for _ = 1, maxTries do
         if bot.status ~= BotStatus.online then
             if waitOnline(15) then
-                bot:warp(upper, doorId)
+                if doorId and doorId ~= "" then
+                    bot:warp(upper, doorId)
+                else
+                    bot:warp(upper)
+                end
             end
         end
         if isInTargetWorld(worldName) then
             pacingSleep(800) -- buffer settling tile & object streaming dari server
+
+            -- Jika target memiliki door ID dan bot masih di White Door (ID 6), re-warp ke door ID
+            if doorId and doorId ~= "" and isAtWhiteDoor() then
+                print(string.format("[Warp] Bot di White Door, re-warp ke door '%s'...", doorId))
+                bot:warp(upper, doorId)
+                pacingSleep(600)
+            end
+
             return true
         end
         sleep(500)
@@ -188,8 +207,8 @@ local function ensureConnectionAndPosition(dest, targetX, targetY)
 
     -- 3. Pemulihan dari White Door (ID 6)
     if isAtWhiteDoor() then
-        print(string.format("[Guard] Bot terdeteksi di White Door (ID 6). Re-warp ke door '%s'...", doorId))
-        if doorId ~= "" then
+        if doorId and doorId ~= "" then
+            print(string.format("[Guard] Bot terdeteksi di White Door (ID 6). Re-warp ke door '%s'...", doorId))
             bot:warp(worldName, doorId)
             pacingSleep(800)
         end
@@ -493,7 +512,7 @@ while runtimeState.currentTakeIndex <= #takeWorlds do
     local enterAttempts = 0
     while not entered and enterAttempts < 5 do
         enterAttempts = enterAttempts + 1
-        if ensureConnectionAndPosition(currentTakeWorld) then
+        if warpAndVerify(currentTakeWorld, settings.WARP_TIMEOUT or 20) and ensureConnectionAndPosition(currentTakeWorld) then
             entered = true
         else
             print(string.format("[Warning] Percobaan masuk ke %s belum berhasil (%d/5). Mencoba lagi...", takeWorldName, enterAttempts))
