@@ -101,10 +101,26 @@ local function isAtWhiteDoor()
     return tile ~= nil and tile.fg == 6
 end
 
+-- Helper parsing destinasi fleksibel: mendukung tabel { world = "...", door = "..." }
+-- maupun string format "WORLD", "WORLD|DOOR", atau "WORLD:DOOR"
+local function parseDestination(dest)
+    if type(dest) == "table" then
+        return dest.world or "", dest.door or ""
+    elseif type(dest) == "string" then
+        local w, d = dest:match("^([^|:]+)[|:](.*)$")
+        if w then
+            return w, d
+        else
+            return dest, ""
+        end
+    end
+    return tostring(dest or ""), ""
+end
+
 -- Helper verifikasi nama world secara case-insensitive
 local function isInTargetWorld(dest)
     if not bot:isInWorld() then return false end
-    local worldName = type(dest) == "table" and dest.world or dest
+    local worldName, _ = parseDestination(dest)
     if not worldName or worldName == "" then return false end
     local upper = worldName:upper()
     return bot:isInWorld(worldName) or bot:isInWorld(upper)
@@ -126,10 +142,10 @@ local function countFloatingObjectsAtTile(world, tx, ty)
 end
 
 -- Warp dengan verifikasi arrival
--- Sesuai signature resmi Lucifer: warp(name: string) atau warp(name: string, id: string)
+-- Sesuai dokumentasi resmi Lucifer v2.86 (docs/lucifer.md baris 335):
+-- | warp(name: string) / warp(name: string, id: string) | Masuk world, dengan door ID opsional. |
 local function warpAndVerify(dest, timeoutSec)
-    local worldName = type(dest) == "table" and dest.world or dest
-    local doorId = type(dest) == "table" and (dest.door or "") or ""
+    local worldName, doorId = parseDestination(dest)
     local upper = type(worldName) == "string" and worldName:upper() or worldName
     local maxTries = (timeoutSec or 20) * 2
 
@@ -140,7 +156,9 @@ local function warpAndVerify(dest, timeoutSec)
 
     bot.leave_world_before_warp = false
 
-    -- Signature resmi Lucifer: HANYA kirim argumen kedua jika door ID ada & tidak kosong!
+    -- Sesuai signature resmi Lucifer:
+    -- Jika door ID ada & tidak kosong -> 2 argumen: bot:warp(name, id)
+    -- Jika door ID tidak ada/kosong   -> 1 argumen: bot:warp(name)
     if doorId and doorId ~= "" then
         bot:warp(upper, doorId)
     else
@@ -176,8 +194,7 @@ end
 
 -- Reconnect & Position Guard komprehensif
 local function ensureConnectionAndPosition(dest, targetX, targetY)
-    local worldName = type(dest) == "table" and dest.world or dest
-    local doorId = type(dest) == "table" and (dest.door or "") or ""
+    local worldName, doorId = parseDestination(dest)
 
     -- 1. Pulihkan koneksi jika bot offline (dibatasi 30 siklus = 5 menit)
     if bot.status ~= BotStatus.online then
@@ -501,12 +518,14 @@ print(string.format("[Transfer] Memulai transfer multi-item untuk %d item target
 
 while runtimeState.currentTakeIndex <= #takeWorlds do
     local currentTakeWorld = takeWorlds[runtimeState.currentTakeIndex]
-    local takeWorldName = type(currentTakeWorld) == "table" and currentTakeWorld.world or currentTakeWorld
+    local takeWorldName, takeDoorId = parseDestination(currentTakeWorld)
 
     runtimeState.phase = "TAKE"
     runtimeState.activeWorld = currentTakeWorld
 
-    print(string.format("[Take] Menuju World Take [%d/%d]: %s", runtimeState.currentTakeIndex, #takeWorlds, takeWorldName))
+    print(string.format("[Take] Menuju World Take [%d/%d]: %s%s", 
+        runtimeState.currentTakeIndex, #takeWorlds, takeWorldName, 
+        (takeDoorId ~= "" and ("|" .. takeDoorId) or "")))
 
     local entered = false
     local enterAttempts = 0
