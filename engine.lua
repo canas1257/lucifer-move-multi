@@ -371,75 +371,69 @@ local function executeStorageDrop()
             local maxShifts = settings.MAX_DROP_RETRY or 15
 
             while shiftCount < maxShifts do
-                -- Wajib verifikasi bot online, di storage world, dan SAMPAI DI TILE (pos.x, pos.y)
-                local arrived = walkToTileSafely(CONFIG.STORAGE_WORLD, pos.x, pos.y)
-                if not arrived then
-                    print(string.format("[Storage Error] Gagal mencapai koordinat drop (%d, %d)! Drop ditangguhkan.", pos.x, pos.y))
-                    return false
-                end
-
-                local before = bot:getInventory():findItem(itemID)
-                if before == 0 then
-                    dropSuccess = true
-                    break
-                end
-
-                bot:setDirection(false)
-
-                -- Percobaan drop di tile saat ini (dibatasi 3 percobaan sebelum evaluasi pergeseran)
                 local localAttempts = 0
                 local tileConfirmedFull = false
 
                 while localAttempts < 3 do
                     localAttempts = localAttempts + 1
 
-                    if not ensureConnectionAndPosition(CONFIG.STORAGE_WORLD, pos.x, pos.y) then
-                        print("[Storage Error] Koneksi terputus saat proses drop!")
+                    -- WAJIB: Setiap percobaan drop harus memverifikasi kedatangan di tile target (pos.x, pos.y)!
+                    local arrived = walkToTileSafely(CONFIG.STORAGE_WORLD, pos.x, pos.y)
+                    if not arrived then
+                        print(string.format("[Storage Error] Gagal mencapai koordinat drop (%d, %d)! Drop ditangguhkan.", pos.x, pos.y))
                         return false
                     end
 
-                    before = bot:getInventory():findItem(itemID)
+                    local before = bot:getInventory():findItem(itemID)
                     if before == 0 then
                         dropSuccess = true
                         break
                     end
 
                     bot:setDirection(false)
-                    local preStatus = bot.status
-                    bot:fastDrop(itemID, before)
-                    local sleepDC = pacingSleep(settings.DROP_DELAY or 400)
-                    local postStatus = bot.status
-                    local inTileAfter = bot:isInTile(pos.x, pos.y)
 
-                    local wasInterrupted = (preStatus ~= BotStatus.online or sleepDC or postStatus ~= BotStatus.online or not inTileAfter)
-
-                    if wasInterrupted then
-                        print("[Storage] Percobaan drop terinterupsi koneksi/posisi. Melakukan pemulihan...")
-                        ensureConnectionAndPosition(CONFIG.STORAGE_WORLD, pos.x, pos.y)
-                        bot:setDirection(false)
-                    end
-
-                    local after = bot:getInventory():findItem(itemID)
-                    if after == 0 then
-                        dropSuccess = true
-                        print(string.format("[Storage] Sukses: Item ID %d (%d unit) telah ter-drop di (%d, %d)", itemID, before, pos.x, pos.y))
-                        break
-                    elseif after < before then
-                        print(string.format("[Storage] Drop sebagian berhasil (%d -> %d). Mencoba sisa di tile yang sama...", before, after))
-                        localAttempts = 0
+                    -- Verifikasi posisi fisik bot: HARUS berada tepat di (pos.x, pos.y)!
+                    if not bot:isInTile(pos.x, pos.y) then
+                        print(string.format("[Storage Warning] Bot tidak berada di tile (%d, %d). Drop dibatalkan untuk re-path...", pos.x, pos.y))
                     else
-                        -- after == before
-                        -- Verifikasi apakah tile BENAR-BENAR PENUH secara fisik (20 objek):
-                        local activeWorldObj = bot:getWorld()
-                        local floatingAtTile = countFloatingObjectsAtTile(activeWorldObj, pos.x, pos.y)
+                        local preStatus = bot.status
+                        bot:fastDrop(itemID, before)
+                        local sleepDC = pacingSleep(settings.DROP_DELAY or 400)
+                        local postStatus = bot.status
+                        local inTileAfter = bot:isInTile(pos.x, pos.y)
 
-                        if floatingAtTile >= 20 then
-                            print(string.format("[Storage] Tile (%d, %d) TERVERIFIKASI PENUH (%d floating objects >= 20).", pos.x, pos.y, floatingAtTile))
-                            tileConfirmedFull = true
+                        local wasInterrupted = (preStatus ~= BotStatus.online or sleepDC or postStatus ~= BotStatus.online or not inTileAfter)
+
+                        if wasInterrupted then
+                            print("[Storage] Percobaan drop terinterupsi koneksi/posisi. Melakukan pemulihan...")
+                            ensureConnectionAndPosition(CONFIG.STORAGE_WORLD, pos.x, pos.y)
+                            bot:setDirection(false)
+                        end
+
+                        local after = bot:getInventory():findItem(itemID)
+                        if after == 0 then
+                            dropSuccess = true
+                            print(string.format("[Storage] Sukses: Item ID %d (%d unit) telah ter-drop di (%d, %d)", itemID, before, pos.x, pos.y))
                             break
+                        elseif after < before then
+                            print(string.format("[Storage] Drop sebagian berhasil (%d -> %d). Mencoba sisa di tile yang sama...", before, after))
+                            localAttempts = 0
                         else
-                            print(string.format("[Storage] Drop belum berkurang di (%d, %d) (Percobaan %d/3, floating objects: %d). Mencoba ulang di tile yang sama...", 
-                                pos.x, pos.y, localAttempts, floatingAtTile))
+                            -- after == before
+                            local activeWorldObj = bot:getWorld()
+                            local floatingAtTile = math.max(
+                                countFloatingObjectsAtTile(activeWorldObj, pos.x + 1, pos.y),
+                                countFloatingObjectsAtTile(activeWorldObj, pos.x, pos.y)
+                            )
+
+                            if floatingAtTile >= 20 then
+                                print(string.format("[Storage] Tile tujuan (%d, %d) TERVERIFIKASI PENUH (%d floating objects >= 20).", pos.x, pos.y, floatingAtTile))
+                                tileConfirmedFull = true
+                                break
+                            else
+                                print(string.format("[Storage] Drop belum berkurang di (%d, %d) (Percobaan %d/3, floating objects: %d). Mencoba ulang di tile yang sama...", 
+                                    pos.x, pos.y, localAttempts, floatingAtTile))
+                            end
                         end
                     end
                 end
