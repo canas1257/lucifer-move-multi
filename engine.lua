@@ -483,9 +483,10 @@ local function executeStorageDrop()
                                     countFloatingObjectsAtTile(activeWorldObj, pos.x, pos.y)
                                 )
 
-                                if floatingAtTile >= 14 or localAttempts >= 3 then
-                                    print(string.format("[Storage] Tile (%d, %d) gagal menampung drop (floating objects: %d, percobaan: %d). Mencari lokasi baru ke kanan...", 
-                                        pos.x, pos.y, floatingAtTile, localAttempts))
+                                -- Jika drop belum berkurang setelah percobaan di tile ini:
+                                if localAttempts >= 2 then
+                                    print(string.format("[Storage] Tile (%d, %d) belum dapat menerima drop setelah %d percobaan (floating objects: %d). Maju ke kanan mencari lokasi baru...", 
+                                        pos.x, pos.y, localAttempts, floatingAtTile))
                                     shouldShiftRight = true
                                     break
                                 end
@@ -733,7 +734,7 @@ if leftover > 0 then
 end
 
 if hasUnreachableItems or hasUnresolvedItems then
-    isTransferCompleted = true
+    isTransferCompleted = false
     print(string.format("[Finish] PROSES SELESAI DENGAN CATATAN: Terdata %s%s. Seluruh item yang berhasil dijangkau telah dipindahkan ke storage.",
         hasUnreachableItems and "objek terhalang jalur (unreachable) " or "",
         hasUnresolvedItems and "objek belum tuntas terambil (ambigu)" or ""))
