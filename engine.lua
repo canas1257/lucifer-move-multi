@@ -2,6 +2,7 @@
 -- ENGINE.LUA - MULTI-ITEM TRANSFER & STORAGE DROP ENGINE (Nuron's Lucifer v2.86)
 -- https://github.com/canas1257/lucifer-move-multi
 -- Author  : Salsa & Bos Anas
+-- Partner : Anna (@anna)
 -- ==============================================================================
 
 local CONFIG = ... or _G.CONFIG
@@ -20,7 +21,7 @@ end
 -- INISIALISASI PENGATURAN BOT
 -- ==============================================================================
 bot.leave_world_before_warp = false  -- Direct subserver warp tanpa menu disconnect
-bot.auto_collect = false            -- Matikan auto collect bawaan agar tidak menyedot sampah
+bot.auto_collect = false            -- Matikan auto collect bawaan agar tidak menyedot sampah liar
 
 local settings = CONFIG.SETTINGS or {}
 bot:setInterval(Action.move, settings.MOVE_INTERVAL or 0.20)
@@ -35,6 +36,9 @@ end
 -- Menyimpan: dropPositions[itemID] = { x = ..., y = ... }
 local dropPositions = {}
 local storageBaseOrigin = nil
+
+-- Blacklist objek yang gagal di-collect berkali-kali untuk mencegah infinite loop
+local failedCollectCount = {}
 
 -- Lifecycle handler
 function on_stop(error_message)
@@ -74,7 +78,7 @@ local function warpAndVerify(dest, timeoutSec)
     for _ = 1, maxTries do
         if bot.status ~= BotStatus.online then return false end
         if (bot:isInWorld(worldName) or bot:isInWorld(upper)) and bot:isInWorld() then
-            sleep(800) -- buffer settling tile & object streaming
+            sleep(800) -- buffer settling tile & object streaming dari server
             return true
         end
         sleep(500)
@@ -103,43 +107,51 @@ local function isAllTargetItemsMax()
     return true
 end
 
--- Mencari objek target di take world yang tasnya belum max 200
-local function findNextTakeableObject()
+-- Memindai seluruh objek target di world:
+-- Return: totalFloating (jumlah semua target di lantai), takeableList (hanya yang tasnya muat & belum blacklist)
+local function scanWorldTargetObjects()
     local world = bot:getWorld()
-    if not world then return nil end
+    if not world then return 0, {} end
 
     local inv = bot:getInventory()
-    if not inv then return nil end
+    if not inv then return 0, {} end
 
     local objects = world:getObjects()
-    if not objects or #objects == 0 then return nil end
+    if not objects or #objects == 0 then return 0, {} end
 
-    local closestObj = nil
-    local shortestDist = 999999
+    local totalFloating = 0
+    local takeableList = {}
 
     for _, obj in ipairs(objects) do
         if isTargetItem[obj.id] then
-            -- Cek kapasitas tas untuk item ini
-            local currentCount = inv:findItem(obj.id)
-            if currentCount < 200 then
-                local tx = math.floor(obj.x / 32)
-                local ty = math.floor(obj.y / 32)
-                local dist = math.abs(bot.x - tx) + math.abs(bot.y - ty)
+            totalFloating = totalFloating + 1
 
-                if dist < shortestDist then
-                    shortestDist = dist
-                    closestObj = {
+            -- Cek apakah objek belum di-blacklist (gagal collect < 3 kali)
+            local failCount = failedCollectCount[obj.oid] or 0
+            if failCount < 3 then
+                -- Cek apakah tas masih bisa menampung item ini (< 200)
+                if inv:findItem(obj.id) < 200 then
+                    local tx = math.floor(obj.x / 32)
+                    local ty = math.floor(obj.y / 32)
+                    local dist = math.abs(bot.x - tx) + math.abs(bot.y - ty)
+                    table.insert(takeableList, {
                         oid = obj.oid,
                         id = obj.id,
                         x = tx,
                         y = ty,
-                    }
+                        dist = dist
+                    })
                 end
             end
         end
     end
 
-    return closestObj
+    -- Urutkan berdasarkan jarak terdekat dari bot
+    table.sort(takeableList, function(a, b)
+        return a.dist < b.dist
+    end)
+
+    return totalFloating, takeableList
 end
 
 -- ==============================================================================
@@ -187,6 +199,8 @@ local function executeStorageDrop()
     end
 
     -- 3. Drop setiap item yang ada di backpack
+    local allItemsDropped = true
+
     for _, itemID in ipairs(CONFIG.ITEMS or {}) do
         local count = bot:getInventory():findItem(itemID)
         if count > 0 then
@@ -233,13 +247,14 @@ local function executeStorageDrop()
             dropPositions[itemID] = { x = pos.x, y = pos.y }
 
             if not dropSuccess then
-                print(string.format("[Warning] Gagal drop seluruh Item ID %d setelah %d kali geser!", itemID, maxRetry))
+                allItemsDropped = false
+                print(string.format("[Critical] Gagal drop seluruh Item ID %d setelah %d kali geser! Sisa di tas: %d", 
+                    itemID, maxRetry, bot:getInventory():findItem(itemID)))
             end
         end
     end
 
-    print("[Storage] Proses drop selesai.")
-    return true
+    return allItemsDropped
 end
 
 -- ==============================================================================
@@ -266,56 +281,107 @@ while currentTakeIndex <= #takeWorlds do
         print(string.format("[Error] Gagal masuk ke Take World: %s. Lewati ke world berikutnya.", takeWorldName))
         currentTakeIndex = currentTakeIndex + 1
     else
-        -- Loop pengambilan barang di world ini
-        local worldHasItems = true
+        -- Reset blacklist gagal collect untuk world ini
+        failedCollectCount = {}
 
-        while worldHasItems do
-            -- 1. Jika semua item target di tas sudah max 200, saatnya pulang ke storage untuk drop
-            if isAllTargetItemsMax() then
-                print("[Take] Seluruh jenis item target di backpack sudah mencapai 200. Menuju storage...")
-                executeStorageDrop()
-                -- Kembali lagi ke take world yang sedang aktif
-                warpAndVerify(currentTakeWorld, settings.WARP_TIMEOUT or 20)
-            end
+        local worldClean = false
 
-            -- 2. Cari objek target berikutnya yang belum max 200 di tas
-            local targetObj = findNextTakeableObject()
+        while not worldClean do
+            -- 1. Pindai status barang di world
+            local totalFloating, takeableList = scanWorldTargetObjects()
 
-            if targetObj then
-                -- Jalan mendekati objek
+            if totalFloating == 0 then
+                -- Tidak ada lagi floating item target sama sekali di world ini -> WORLD BENAR-BENAR BERSIH!
+                print(string.format("[Take] World %s sudah BERSIH dari seluruh item target.", takeWorldName))
+                worldClean = true
+
+                -- Jika masih ada barang di tas, bawa ke storage
+                if countTargetItemsInInventory() > 0 then
+                    print("[Take] Membawa sisa barang dari world ini ke storage...")
+                    local dropOk = executeStorageDrop()
+                    if not dropOk then
+                        print("[Critical Error] Drop di storage gagal tuntas! Script dihentikan demi keamanan.")
+                        return
+                    end
+                end
+
+                -- Pindah ke world berikutnya
+                currentTakeIndex = currentTakeIndex + 1
+                break
+
+            elseif #takeableList == 0 then
+                -- Ada floating target di world, tapi tas bot tidak bisa menampungnya (karena semua jenis item yang ada di lantai sudah 200 di tas)
+                print(string.format("[Take] Tas penuh untuk seluruh item target yang ada di lantai (%d objek tersisa). Drop ke storage lalu kembali lagi...", totalFloating))
+
+                local dropOk = executeStorageDrop()
+                if not dropOk then
+                    print("[Critical Error] Drop di storage gagal tuntas! Script dihentikan demi keamanan.")
+                    return
+                end
+
+                -- WAJIB kembali ke world take yang sama untuk menyapu sisa floating items!
+                print(string.format("[Take] Kembali ke world take: %s...", takeWorldName))
+                local returned = warpAndVerify(currentTakeWorld, settings.WARP_TIMEOUT or 20)
+                if not returned then
+                    print(string.format("[Error] Gagal warp kembali ke %s! Mencoba sekali lagi...", takeWorldName))
+                    returned = warpAndVerify(currentTakeWorld, settings.WARP_TIMEOUT or 20)
+                    if not returned then
+                        print(string.format("[Critical Error] Tidak dapat kembali ke world take %s. Script berhenti.", takeWorldName))
+                        return
+                    end
+                end
+
+            else
+                -- Masih ada objek yang bisa diambil di tas
+                local targetObj = takeableList[1]
                 local reached = bot:findPath(targetObj.x, targetObj.y)
                 if not reached then
-                    -- Coba posisi samping jika tidak bisa pas di tile-nya
                     bot:findPath(targetObj.x - 1, targetObj.y)
                 end
 
-                -- Ambil objek
+                local beforeCount = bot:getInventory():findItem(targetObj.id)
                 bot:collectObject(targetObj.oid, 2)
                 sleep(200)
-            else
-                -- Sudah tidak ada lagi floating objek target yang bisa diambil di world ini
-                worldHasItems = false
-                print(string.format("[Take] Tidak ada lagi floating item target yang dapat diambil di world %s.", takeWorldName))
 
-                -- Jika masih ada barang di tas, drop dulu ke storage
-                if countTargetItemsInInventory() > 0 then
-                    print("[Take] Membawa sisa barang di backpack ke storage...")
-                    executeStorageDrop()
+                local afterCount = bot:getInventory():findItem(targetObj.id)
+                if afterCount == beforeCount then
+                    -- Objek gagal diambil (mungkin terhalang atau unreachable)
+                    failedCollectCount[targetObj.oid] = (failedCollectCount[targetObj.oid] or 0) + 1
                 end
 
-                -- Lanjut ke world take berikutnya
-                currentTakeIndex = currentTakeIndex + 1
+                -- Jika seluruh jenis item target di tas sudah max 200, segera bawa ke storage
+                if isAllTargetItemsMax() then
+                    print("[Take] Seluruh slot item target di tas sudah max 200. Menuju storage...")
+                    local dropOk = executeStorageDrop()
+                    if not dropOk then
+                        print("[Critical Error] Drop di storage gagal tuntas! Script dihentikan demi keamanan.")
+                        return
+                    end
+
+                    -- Kembali ke world take yang sama
+                    print(string.format("[Take] Kembali ke world take: %s...", takeWorldName))
+                    local returned = warpAndVerify(currentTakeWorld, settings.WARP_TIMEOUT or 20)
+                    if not returned then
+                        print(string.format("[Critical Error] Gagal kembali ke world take %s. Script berhenti.", takeWorldName))
+                        return
+                    end
+                end
             end
         end
     end
 end
 
 -- ==============================================================================
--- FINAL SWEEP / DROP SISA BACKPACK DI WORLD TERAKHIR
+-- FINAL INTEGRITY VERIFICATION
 -- ==============================================================================
-if countTargetItemsInInventory() > 0 then
-    print("[Finish] Seluruh take world selesai. Melakukan drop sisa barang di storage...")
-    executeStorageDrop()
+local leftover = countTargetItemsInInventory()
+if leftover > 0 then
+    print(string.format("[Finish] Melakukan drop akhir sisa %d barang di storage...", leftover))
+    local finalDropOk = executeStorageDrop()
+    if not finalDropOk or countTargetItemsInInventory() > 0 then
+        print(string.format("[Warning] Masih ada %d item tersisa di tas setelah drop akhir! Script dihentikan tanpa konfirmasi sukses.", countTargetItemsInInventory()))
+        return
+    end
 end
 
-print("[Finish] SEMUA ITEM DARI SELURUH TAKE WORLD TELAH BERHASIL DIPINDAHKAN KE STORAGE! Script selesai.")
+print("[Finish] SEMUA ITEM DARI SELURUH TAKE WORLD TELAH BERHASIL DIPINDAHKAN KE STORAGE TANPA SISA! Script selesai.")
