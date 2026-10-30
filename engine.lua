@@ -548,37 +548,53 @@ while runtimeState.currentTakeIndex <= #takeWorlds do
 
                 ensureConnectionAndPosition(currentTakeWorld, targetObj.x, targetObj.y)
 
+                -- 1. Jalankan pathfinding mendekati objek
                 local reached = bot:findPath(targetObj.x, targetObj.y)
                 if not reached then
-                    bot:findPath(targetObj.x - 1, targetObj.y)
+                    reached = bot:findPath(targetObj.x - 1, targetObj.y)
+                end
+                if not reached then
+                    reached = bot:findPath(targetObj.x + 1, targetObj.y)
                 end
 
-                local beforeCount = bot:getInventory():findItem(targetObj.id)
-
-                -- Verifikasi koneksi sebelum memanggil collect
-                local preCollectDC = (bot.status ~= BotStatus.online or not isInTargetWorld(currentTakeWorld))
-                bot:collectObject(targetObj.oid, 2)
-                local sleepDC = pacingSleep(200)
-                local postCollectDC = (bot.status ~= BotStatus.online or not isInTargetWorld(currentTakeWorld))
-
-                local wasDC = preCollectDC or sleepDC or postCollectDC
-
-                if wasDC then
-                    print("[Take] Terdeteksi disconnect saat collect! Melakukan recovery...")
-                    ensureConnectionAndPosition(currentTakeWorld, targetObj.x, targetObj.y)
-                end
-
-                local afterCount = bot:getInventory():findItem(targetObj.id)
-
-                if afterCount == beforeCount then
-                    -- HANYA TAMBAHKAN BLACKLIST JIKA ONLINE STABIL DAN TIDAK PERNAH ADA INTERUPSI DC!
-                    if not wasDC and bot.status == BotStatus.online and isInTargetWorld(currentTakeWorld) then
+                -- 2. Jika jalur fisik terhalang (tidak bisa dicapai sama sekali)
+                if not reached then
+                    print(string.format("[Take] Tidak ada jalur jangkauan menuju OID %d di (%d, %d).", targetObj.oid, targetObj.x, targetObj.y))
+                    -- Hanya kegagalan jangkauan fisik terverifikasi yang boleh menaikkan hitungan unreachable
+                    if bot.status == BotStatus.online and isInTargetWorld(currentTakeWorld) then
                         failedCollectCount[targetObj.oid] = (failedCollectCount[targetObj.oid] or 0) + 1
-                    else
-                        print(string.format("[Take] Pengambilan OID %d terinterupsi koneksi putus; percobaan tidak dihitung sebagai kegagalan jangkauan.", targetObj.oid))
                     end
                 else
-                    failedCollectCount[targetObj.oid] = nil
+                    -- 3. Bot berhasil mendekati objek. Verifikasi koneksi sebelum collect!
+                    if bot.status ~= BotStatus.online or not isInTargetWorld(currentTakeWorld) then
+                        print("[Take] Terdeteksi gangguan koneksi sebelum collect. Menjalankan recovery & re-scan...")
+                        ensureConnectionAndPosition(currentTakeWorld)
+                    else
+                        local beforeCount = bot:getInventory():findItem(targetObj.id)
+
+                        bot:collectObject(targetObj.oid, 2)
+                        local sleepDC = pacingSleep(200)
+
+                        -- Verifikasi koneksi pasca collect
+                        local postCollectDC = (bot.status ~= BotStatus.online or not isInTargetWorld(currentTakeWorld))
+                        local wasDC = sleepDC or postCollectDC
+
+                        if wasDC then
+                            print("[Take] Terdeteksi gangguan koneksi saat/pasca collect. Menjalankan recovery...")
+                            ensureConnectionAndPosition(currentTakeWorld, targetObj.x, targetObj.y)
+                        end
+
+                        local afterCount = bot:getInventory():findItem(targetObj.id)
+
+                        if afterCount > beforeCount then
+                            -- Sukses mengambil item
+                            failedCollectCount[targetObj.oid] = nil
+                        else
+                            -- Jika barang belum terambil tetapi bot berhasil sampai di tile objek:
+                            -- Ini situasi ambigu (timing/lag/DC), JANGAN anggap sebagai kegagalan jangkauan!
+                            print(string.format("[Take] Objek OID %d belum terambil ke tas di (%d, %d). Mengulang scan pada siklus berikutnya...", targetObj.oid, targetObj.x, targetObj.y))
+                        end
+                    end
                 end
 
                 if isAllTargetItemsMax() then
