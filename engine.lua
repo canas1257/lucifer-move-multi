@@ -36,9 +36,15 @@ end
 local dropPositions = {}
 local storageBaseOrigin = nil
 
--- Blacklist objek yang gagal di-collect berkali-kali (hanya jika online stabil & gagal valid)
-local failedCollectCount = {}
+-- Pelacakan jangkauan fisik terhalang (unreachable path)
+local unreachablePathCount = {}
+
+-- Pelacakan percobaan collect tanpa progres (ambigu / server timing)
+local collectAttemptCount = {}
+local unresolvedCollectObjects = {}
+
 local hasUnreachableItems = false
+local hasUnresolvedItems = false
 
 -- Runtime state tracking untuk pemulihan disconnect
 local runtimeState = {
@@ -70,7 +76,7 @@ local function waitOnline(timeoutSec)
     return false
 end
 
--- Sleep dengan slicing 50ms untuk mendeteksi disconnect cepat yang pulih di tengah jeda
+-- Sleep dengan slicing 50ms untuk mendeteksi disconnect yang pulih di tengah jeda
 local function pacingSleep(ms)
     local interval = 50
     local steps = math.max(1, math.floor(ms / interval))
@@ -104,6 +110,21 @@ local function isInTargetWorld(dest)
     return bot:isInWorld(worldName) or bot:isInWorld(upper)
 end
 
+-- Hitung floating objects pada tile tertentu di world
+local function countFloatingObjectsAtTile(world, tx, ty)
+    if not world then return 0 end
+    local objs = world:getObjects() or {}
+    local count = 0
+    for _, obj in ipairs(objs) do
+        local ox = math.floor(obj.x / 32)
+        local oy = math.floor(obj.y / 32)
+        if ox == tx and oy == ty then
+            count = count + 1
+        end
+    end
+    return count
+end
+
 -- Warp dengan verifikasi arrival
 local function warpAndVerify(dest, timeoutSec)
     local worldName = type(dest) == "table" and dest.world or dest
@@ -135,7 +156,6 @@ local function warpAndVerify(dest, timeoutSec)
 end
 
 -- Reconnect & Position Guard komprehensif
--- Menjamin bot online, benar-benar berada di world tujuan, dan pulih dari White Door
 local function ensureConnectionAndPosition(dest, targetX, targetY)
     local worldName = type(dest) == "table" and dest.world or dest
     local doorId = type(dest) == "table" and (dest.door or "") or ""
@@ -233,36 +253,37 @@ end
 -- Memindai seluruh objek target di world dengan proteksi disconnect:
 local function scanWorldTargetObjects(activeWorld)
     if not ensureConnectionAndPosition(activeWorld) then
-        return false, 0, {}, 0, 0
+        return false, 0, {}, 0, 0, 0
     end
 
     local world = bot:getWorld()
-    if not world then return false, 0, {}, 0, 0 end
+    if not world then return false, 0, {}, 0, 0, 0 end
 
     local inv = bot:getInventory()
-    if not inv then return false, 0, {}, 0, 0 end
+    if not inv then return false, 0, {}, 0, 0, 0 end
 
     local objects = world:getObjects()
-    if not objects then return false, 0, {}, 0, 0 end
+    if not objects then return false, 0, {}, 0, 0, 0 end
 
-    -- Verifikasi ulang status bot SETELAH pemanggilan getObjects()
     if bot.status ~= BotStatus.online or not isInTargetWorld(activeWorld) then
         print("[Take] Terdeteksi disconnect saat/setelah getObjects(). Scan dibatalkan untuk diulang.")
-        return false, 0, {}, 0, 0
+        return false, 0, {}, 0, 0, 0
     end
 
     local totalFloating = 0
     local takeableList = {}
     local capacityDeferredCount = 0
-    local blockedCount = 0
+    local unreachablePathCountTotal = 0
+    local unresolvedAttemptCountTotal = 0
 
     for _, obj in ipairs(objects) do
         if isTargetItem[obj.id] then
             totalFloating = totalFloating + 1
 
-            local failCount = failedCollectCount[obj.oid] or 0
-            if failCount >= 3 then
-                blockedCount = blockedCount + 1
+            if (unreachablePathCount[obj.oid] or 0) >= 3 then
+                unreachablePathCountTotal = unreachablePathCountTotal + 1
+            elseif unresolvedCollectObjects[obj.oid] then
+                unresolvedAttemptCountTotal = unresolvedAttemptCountTotal + 1
             else
                 if inv:findItem(obj.id) < 200 then
                     local tx = math.floor(obj.x / 32)
@@ -286,11 +307,11 @@ local function scanWorldTargetObjects(activeWorld)
         return a.dist < b.dist
     end)
 
-    return true, totalFloating, takeableList, capacityDeferredCount, blockedCount
+    return true, totalFloating, takeableList, capacityDeferredCount, unreachablePathCountTotal, unresolvedAttemptCountTotal
 end
 
 -- ==============================================================================
--- LOGIKA DROP DI STORAGE WORLD (Pemisahan Vertikal per Item ID & Anti-DC)
+-- LOGIKA DROP DI STORAGE WORLD (Pemisahan Vertikal & Anti-DC Robust)
 -- ==============================================================================
 
 local function executeStorageDrop()
@@ -346,11 +367,10 @@ local function executeStorageDrop()
             runtimeState.targetY = pos.y
 
             local dropSuccess = false
-            local retry = 0
-            local maxRetry = settings.MAX_DROP_RETRY or 15
-            local consecutiveRejections = 0
+            local shiftCount = 0
+            local maxShifts = settings.MAX_DROP_RETRY or 15
 
-            while retry < maxRetry do
+            while shiftCount < maxShifts do
                 -- Wajib verifikasi bot online, di storage world, dan SAMPAI DI TILE (pos.x, pos.y)
                 local arrived = walkToTileSafely(CONFIG.STORAGE_WORLD, pos.x, pos.y)
                 if not arrived then
@@ -364,62 +384,80 @@ local function executeStorageDrop()
                     break
                 end
 
-                -- Hadap kanan sebelum drop
                 bot:setDirection(false)
 
-                -- Verifikasi ketat tepat sebelum memanggil fastDrop:
-                -- Bot HARUS online dan berada tepat di tile drop!
-                if bot.status ~= BotStatus.online or not isInTargetWorld(CONFIG.STORAGE_WORLD) or not bot:isInTile(pos.x, pos.y) then
-                    print("[Storage] Kondisi koneksi/posisi belum valid sesaat sebelum drop. Mengulang perjalanan...")
-                    ensureConnectionAndPosition(CONFIG.STORAGE_WORLD, pos.x, pos.y)
-                else
+                -- Percobaan drop di tile saat ini (dibatasi 3 percobaan sebelum evaluasi pergeseran)
+                local localAttempts = 0
+                local tileConfirmedFull = false
+
+                while localAttempts < 3 do
+                    localAttempts = localAttempts + 1
+
+                    if not ensureConnectionAndPosition(CONFIG.STORAGE_WORLD, pos.x, pos.y) then
+                        print("[Storage Error] Koneksi terputus saat proses drop!")
+                        return false
+                    end
+
+                    before = bot:getInventory():findItem(itemID)
+                    if before == 0 then
+                        dropSuccess = true
+                        break
+                    end
+
+                    bot:setDirection(false)
                     local preStatus = bot.status
                     bot:fastDrop(itemID, before)
                     local sleepDC = pacingSleep(settings.DROP_DELAY or 400)
                     local postStatus = bot.status
                     local inTileAfter = bot:isInTile(pos.x, pos.y)
 
-                    local wasInterruptedByDC = (preStatus ~= BotStatus.online or sleepDC or postStatus ~= BotStatus.online or not isInTargetWorld(CONFIG.STORAGE_WORLD) or not inTileAfter)
+                    local wasInterrupted = (preStatus ~= BotStatus.online or sleepDC or postStatus ~= BotStatus.online or not inTileAfter)
 
-                    if wasInterruptedByDC then
-                        print("[Storage] Gangguan koneksi terdeteksi saat/pasca fastDrop. Menjalankan recovery...")
+                    if wasInterrupted then
+                        print("[Storage] Percobaan drop terinterupsi koneksi/posisi. Melakukan pemulihan...")
                         ensureConnectionAndPosition(CONFIG.STORAGE_WORLD, pos.x, pos.y)
                         bot:setDirection(false)
                     end
 
-                    -- BACA ULANG BACKPACK SETELAH PULIH
                     local after = bot:getInventory():findItem(itemID)
-
                     if after == 0 then
-                        -- Drop sukses (termasuk jika diterima server sebelum DC terdeteksi)!
                         dropSuccess = true
                         print(string.format("[Storage] Sukses: Item ID %d (%d unit) telah ter-drop di (%d, %d)", itemID, before, pos.x, pos.y))
                         break
                     elseif after < before then
-                        -- Sebagian unit item ter-drop
                         print(string.format("[Storage] Drop sebagian berhasil (%d -> %d). Mencoba sisa di tile yang sama...", before, after))
-                        consecutiveRejections = 0
+                        localAttempts = 0
                     else
                         -- after == before
-                        if wasInterruptedByDC then
-                            -- Gagal karena koneksi putus (bukan karena kapasitas tile) -> jangan geser slot!
-                            print(string.format("[Storage] Drop terinterupsi DC (bukan tile penuh). Mencoba ulang di (%d, %d)...", pos.x, pos.y))
-                        else
-                            consecutiveRejections = consecutiveRejections + 1
-                            if consecutiveRejections >= 2 then
-                                -- Terkonfirmasi 2x ditolak saat online stabil di tile yang sama -> TILE PENUH
-                                retry = retry + 1
-                                pos.x = pos.x + 1
-                                consecutiveRejections = 0
-                                print(string.format("[Storage] Tile (%d, %d) penuh/gagal drop ID %d. Geser ke kanan (%d, %d)...", pos.x - 1, pos.y, itemID, pos.x, pos.y))
+                        -- Verifikasi apakah tile BENAR-BENAR PENUH secara fisik (20 objek):
+                        local activeWorldObj = bot:getWorld()
+                        local floatingAtTile = countFloatingObjectsAtTile(activeWorldObj, pos.x, pos.y)
 
-                                walkToTileSafely(CONFIG.STORAGE_WORLD, pos.x, pos.y)
-                                bot:setDirection(false)
-                            else
-                                print(string.format("[Storage] Percobaan drop belum berkurang di (%d, %d). Mengulang konfirmasi sebelum geser...", pos.x, pos.y))
-                            end
+                        if floatingAtTile >= 20 then
+                            print(string.format("[Storage] Tile (%d, %d) TERVERIFIKASI PENUH (%d floating objects >= 20).", pos.x, pos.y, floatingAtTile))
+                            tileConfirmedFull = true
+                            break
+                        else
+                            print(string.format("[Storage] Drop belum berkurang di (%d, %d) (Percobaan %d/3, floating objects: %d). Mencoba ulang di tile yang sama...", 
+                                pos.x, pos.y, localAttempts, floatingAtTile))
                         end
                     end
+                end
+
+                if dropSuccess then
+                    break
+                elseif tileConfirmedFull then
+                    -- Tile memang terbukti penuh secara fisik -> geser ke kanan (pos.x + 1)
+                    shiftCount = shiftCount + 1
+                    pos.x = pos.x + 1
+                    print(string.format("[Storage] Menggeser slot Item ID %d ke kanan: (%d, %d)...", itemID, pos.x, pos.y))
+                    walkToTileSafely(CONFIG.STORAGE_WORLD, pos.x, pos.y)
+                    bot:setDirection(false)
+                else
+                    -- 3 kali percobaan tidak berkurang dan tile TIDAK terbukti 20 objek:
+                    -- Ini kegagalan ambigu (gangguan jaringan/server reject). JANGAN GESER SLOT!
+                    print(string.format("[Storage Warning] Drop Item ID %d di (%d, %d) tidak tuntas setelah 3 percobaan (bukan karena kapasitas penuh). Menghentikan drop demi keamanan agar slot tidak berantakan.", itemID, pos.x, pos.y))
+                    return false
                 end
             end
 
@@ -427,8 +465,6 @@ local function executeStorageDrop()
 
             if not dropSuccess then
                 allItemsDropped = false
-                print(string.format("[Critical] Gagal drop seluruh Item ID %d setelah %d kali geser! Sisa di tas: %d", 
-                    itemID, maxRetry, bot:getInventory():findItem(itemID)))
             end
         end
     end
@@ -476,11 +512,14 @@ while runtimeState.currentTakeIndex <= #takeWorlds do
         hasUnreachableItems = true
         runtimeState.currentTakeIndex = runtimeState.currentTakeIndex + 1
     else
-        failedCollectCount = {}
+        unreachablePathCount = {}
+        collectAttemptCount = {}
+        unresolvedCollectObjects = {}
+
         local worldClean = false
 
         while not worldClean do
-            local ready, totalFloating, takeableList, capacityDeferredCount, blockedCount = scanWorldTargetObjects(currentTakeWorld)
+            local ready, totalFloating, takeableList, capacityDeferredCount, unreachablePathTotal, unresolvedTotal = scanWorldTargetObjects(currentTakeWorld)
 
             if not ready then
                 print("[Take] Menunggu world settled / recovery koneksi...")
@@ -502,10 +541,13 @@ while runtimeState.currentTakeIndex <= #takeWorlds do
                 runtimeState.currentTakeIndex = runtimeState.currentTakeIndex + 1
                 break
 
-            elseif #takeableList == 0 and capacityDeferredCount == 0 and blockedCount > 0 then
-                -- HANYA TERSISA OBJEK TERBLOKIR / BLACKLIST
-                print(string.format("[Warning] World %s masih memiliki %d objek target terblokir/unreachable (gagal collect >= 3x). Melewati objek ini.", takeWorldName, blockedCount))
-                hasUnreachableItems = true
+            elseif #takeableList == 0 and capacityDeferredCount == 0 and (unreachablePathTotal > 0 or unresolvedTotal > 0) then
+                -- HANYA TERSISA OBJEK TERHALANG JALUR ATAU PERCOBAAN AMBIGU TANPA PROGRES
+                print(string.format("[Warning] World %s selesai dengan catatan: %d objek terhalang jalur (unreachable), %d objek ambigu tanpa progres.", 
+                    takeWorldName, unreachablePathTotal, unresolvedTotal))
+
+                if unreachablePathTotal > 0 then hasUnreachableItems = true end
+                if unresolvedTotal > 0 then hasUnresolvedItems = true end
                 worldClean = true
 
                 if countTargetItemsInInventory() > 0 then
@@ -559,10 +601,9 @@ while runtimeState.currentTakeIndex <= #takeWorlds do
 
                 -- 2. Jika jalur fisik terhalang (tidak bisa dicapai sama sekali)
                 if not reached then
-                    print(string.format("[Take] Tidak ada jalur jangkauan menuju OID %d di (%d, %d).", targetObj.oid, targetObj.x, targetObj.y))
-                    -- Hanya kegagalan jangkauan fisik terverifikasi yang boleh menaikkan hitungan unreachable
+                    print(string.format("[Take] Tidak ada jalur fisik menuju OID %d di (%d, %d).", targetObj.oid, targetObj.x, targetObj.y))
                     if bot.status == BotStatus.online and isInTargetWorld(currentTakeWorld) then
-                        failedCollectCount[targetObj.oid] = (failedCollectCount[targetObj.oid] or 0) + 1
+                        unreachablePathCount[targetObj.oid] = (unreachablePathCount[targetObj.oid] or 0) + 1
                     end
                 else
                     -- 3. Bot berhasil mendekati objek. Verifikasi koneksi sebelum collect!
@@ -575,7 +616,6 @@ while runtimeState.currentTakeIndex <= #takeWorlds do
                         bot:collectObject(targetObj.oid, 2)
                         local sleepDC = pacingSleep(200)
 
-                        -- Verifikasi koneksi pasca collect
                         local postCollectDC = (bot.status ~= BotStatus.online or not isInTargetWorld(currentTakeWorld))
                         local wasDC = sleepDC or postCollectDC
 
@@ -587,12 +627,22 @@ while runtimeState.currentTakeIndex <= #takeWorlds do
                         local afterCount = bot:getInventory():findItem(targetObj.id)
 
                         if afterCount > beforeCount then
-                            -- Sukses mengambil item
-                            failedCollectCount[targetObj.oid] = nil
+                            -- Sukses mengambil item!
+                            collectAttemptCount[targetObj.oid] = nil
+                            unreachablePathCount[targetObj.oid] = nil
                         else
-                            -- Jika barang belum terambil tetapi bot berhasil sampai di tile objek:
-                            -- Ini situasi ambigu (timing/lag/DC), JANGAN anggap sebagai kegagalan jangkauan!
-                            print(string.format("[Take] Objek OID %d belum terambil ke tas di (%d, %d). Mengulang scan pada siklus berikutnya...", targetObj.oid, targetObj.x, targetObj.y))
+                            -- Bot sudah di tile objek tapi barang belum masuk tas:
+                            -- Catat percobaan tanpa progres secara terbatas
+                            local attempts = (collectAttemptCount[targetObj.oid] or 0) + 1
+                            collectAttemptCount[targetObj.oid] = attempts
+
+                            if attempts >= 4 then
+                                -- Batas percobaan tercapai! Tandai sebagai unresolved (ambigu), JANGAN blacklist unreachable!
+                                print(string.format("[Take Warning] Objek OID %d tidak bertambah di tas setelah %d percobaan. Menandai sebagai belum tuntas (ambigu) agar tidak loop tak terbatas.", targetObj.oid, attempts))
+                                unresolvedCollectObjects[targetObj.oid] = true
+                            else
+                                print(string.format("[Take] Objek OID %d belum masuk tas (Percobaan %d/4). Mengulang pada siklus berikutnya...", targetObj.oid, attempts))
+                            end
                         end
                     end
                 end
@@ -633,8 +683,10 @@ if leftover > 0 then
     end
 end
 
-if hasUnreachableItems then
-    print("[Finish] SEMUA WORLD SELESAI DIPROSES DENGAN CATATAN: Ada objek unreachable/terblokir di world take yang dilewati. Barang yang dapat dijangkau berhasil dipindahkan ke storage.")
+if hasUnreachableItems or hasUnresolvedItems then
+    print(string.format("[Finish] PROSES SELESAI DENGAN CATATAN: Terdata %s%s. Seluruh item yang berhasil dijangkau telah dipindahkan ke storage.",
+        hasUnreachableItems and "objek terhalang jalur (unreachable) " or "",
+        hasUnresolvedItems and "objek belum tuntas terambil (ambigu)" or ""))
 else
     print("[Finish] SEMUA ITEM DARI SELURUH TAKE WORLD TELAH BERHASIL DIPINDAHKAN KE STORAGE TANPA SISA! Script selesai.")
 end
