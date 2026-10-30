@@ -39,6 +39,7 @@ local storageBaseOrigin = nil
 
 -- Blacklist objek yang gagal di-collect berkali-kali untuk mencegah infinite loop
 local failedCollectCount = {}
+local hasUnreachableItems = false
 
 -- Lifecycle handler
 function on_stop(error_message)
@@ -108,28 +109,34 @@ local function isAllTargetItemsMax()
 end
 
 -- Memindai seluruh objek target di world:
--- Return: totalFloating (jumlah semua target di lantai), takeableList (hanya yang tasnya muat & belum blacklist)
+-- Return:
+-- 1. totalFloating: jumlah seluruh objek target di lantai
+-- 2. takeableList: list objek yang tasnya muat (< 200) & belum blacklist
+-- 3. capacityDeferredCount: jumlah objek yang belum blacklist tapi tasnya sudah penuh (>= 200)
+-- 4. blockedCount: jumlah objek yang sudah blacklist (gagal collect >= 3x)
 local function scanWorldTargetObjects()
     local world = bot:getWorld()
-    if not world then return 0, {} end
+    if not world then return 0, {}, 0, 0 end
 
     local inv = bot:getInventory()
-    if not inv then return 0, {} end
+    if not inv then return 0, {}, 0, 0 end
 
     local objects = world:getObjects()
-    if not objects or #objects == 0 then return 0, {} end
+    if not objects or #objects == 0 then return 0, {}, 0, 0 end
 
     local totalFloating = 0
     local takeableList = {}
+    local capacityDeferredCount = 0
+    local blockedCount = 0
 
     for _, obj in ipairs(objects) do
         if isTargetItem[obj.id] then
             totalFloating = totalFloating + 1
 
-            -- Cek apakah objek belum di-blacklist (gagal collect < 3 kali)
             local failCount = failedCollectCount[obj.oid] or 0
-            if failCount < 3 then
-                -- Cek apakah tas masih bisa menampung item ini (< 200)
+            if failCount >= 3 then
+                blockedCount = blockedCount + 1
+            else
                 if inv:findItem(obj.id) < 200 then
                     local tx = math.floor(obj.x / 32)
                     local ty = math.floor(obj.y / 32)
@@ -141,6 +148,8 @@ local function scanWorldTargetObjects()
                         y = ty,
                         dist = dist
                     })
+                else
+                    capacityDeferredCount = capacityDeferredCount + 1
                 end
             end
         end
@@ -151,7 +160,7 @@ local function scanWorldTargetObjects()
         return a.dist < b.dist
     end)
 
-    return totalFloating, takeableList
+    return totalFloating, takeableList, capacityDeferredCount, blockedCount
 end
 
 -- ==============================================================================
@@ -288,7 +297,7 @@ while currentTakeIndex <= #takeWorlds do
 
         while not worldClean do
             -- 1. Pindai status barang di world
-            local totalFloating, takeableList = scanWorldTargetObjects()
+            local totalFloating, takeableList, capacityDeferredCount, blockedCount = scanWorldTargetObjects()
 
             if totalFloating == 0 then
                 -- Tidak ada lagi floating item target sama sekali di world ini -> WORLD BENAR-BENAR BERSIH!
@@ -309,9 +318,29 @@ while currentTakeIndex <= #takeWorlds do
                 currentTakeIndex = currentTakeIndex + 1
                 break
 
-            elseif #takeableList == 0 then
-                -- Ada floating target di world, tapi tas bot tidak bisa menampungnya (karena semua jenis item yang ada di lantai sudah 200 di tas)
-                print(string.format("[Take] Tas penuh untuk seluruh item target yang ada di lantai (%d objek tersisa). Drop ke storage lalu kembali lagi...", totalFloating))
+            elseif #takeableList == 0 and capacityDeferredCount == 0 and blockedCount > 0 then
+                -- HANYA TERSISA OBJEK TERBLOKIR / BLACKLIST!
+                -- Tas bot tidak penuh, dan tidak ada objek yang tertunda karena kapasitas.
+                -- Jangan looping warp ke storage! Berhenti menyapu world ini dan lanjut world berikutnya.
+                print(string.format("[Warning] World %s masih memiliki %d objek target terblokir/unreachable (gagal collect >= 3x). Melewati objek ini.", takeWorldName, blockedCount))
+                hasUnreachableItems = true
+                worldClean = true
+
+                if countTargetItemsInInventory() > 0 then
+                    print("[Take] Membawa sisa barang yang terkumpul dari world ini ke storage...")
+                    local dropOk = executeStorageDrop()
+                    if not dropOk then
+                        print("[Critical Error] Drop di storage gagal tuntas! Script dihentikan demi keamanan.")
+                        return
+                    end
+                end
+
+                currentTakeIndex = currentTakeIndex + 1
+                break
+
+            elseif #takeableList == 0 and capacityDeferredCount > 0 then
+                -- Ada floating target yang bisa diambil, tapi tas bot saat ini penuh untuk seluruh item yang ada di lantai
+                print(string.format("[Take] Tas penuh untuk seluruh item target yang ada di lantai (%d objek tertunda karena kapasitas). Drop ke storage lalu kembali lagi...", capacityDeferredCount))
 
                 local dropOk = executeStorageDrop()
                 if not dropOk then
@@ -384,4 +413,8 @@ if leftover > 0 then
     end
 end
 
-print("[Finish] SEMUA ITEM DARI SELURUH TAKE WORLD TELAH BERHASIL DIPINDAHKAN KE STORAGE TANPA SISA! Script selesai.")
+if hasUnreachableItems then
+    print("[Finish] SEMUA WORLD SELESAI DIPROSES DENGAN CATATAN: Ada objek unreachable/terblokir di world take yang dilewati. Barang yang dapat dijangkau berhasil dipindahkan ke storage.")
+else
+    print("[Finish] SEMUA ITEM DARI SELURUH TAKE WORLD TELAH BERHASIL DIPINDAHKAN KE STORAGE TANPA SISA! Script selesai.")
+end
